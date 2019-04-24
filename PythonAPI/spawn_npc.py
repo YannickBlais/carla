@@ -67,6 +67,7 @@ def main():
 
         world = client.get_world()
         blueprints = world.get_blueprint_library().filter('vehicle.*')
+        walker_blueprints = world.get_blueprint_library().filter('walker.*')
 
         if args.safe:
             blueprints = [x for x in blueprints if int(x.get_attribute('number_of_wheels')) == 4]
@@ -86,6 +87,19 @@ def main():
                 return True
             return False
 
+        def try_spawn_random_walker_at(transform):
+            blueprint = random.choice(walker_blueprints)
+            if blueprint.has_attribute('color'):
+                color = random.choice(blueprint.get_attribute('color').recommended_values)
+                blueprint.set_attribute('color', color)
+            walker = world.try_spawn_actor(blueprint, transform)
+            if walker is not None:
+                actor_list.append(walker)
+                print('spawned %r at %s' % (walker.type_id, transform.location))
+                return True
+            return False
+
+
         # @todo Needs to be converted to list to be shuffled.
         spawn_points = list(world.get_map().get_spawn_points())
         random.shuffle(spawn_points)
@@ -94,9 +108,13 @@ def main():
 
         count = args.number_of_vehicles
 
+        spawn_vehicle = True
         for spawn_point in spawn_points:
-            if try_spawn_random_vehicle_at(spawn_point):
+            if spawn_vehicle and try_spawn_random_vehicle_at(spawn_point):
                 count -= 1
+            elif try_spawn_random_walker_at(spawn_point):
+                count -= 1
+            spawn_vehicle = not spawn_vehicle
             if count <= 0:
                 break
 

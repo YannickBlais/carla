@@ -207,17 +207,20 @@ class World(object):
         self.hud.render(display)
 
     def destroySensors(self):
-            self.camera_manager.sensor.destroy()
+            for sensor in self.camera_manager.sensors:
+                sensor.destry()
+            self.camera_manager.sensors.destroy()
             self.camera_manager.sensor = None
             self.camera_manager._index = None
 
     def destroy(self):
         actors = [
-            self.camera_manager.sensor,
             self.collision_sensor.sensor,
             self.lane_invasion_sensor.sensor,
             self.gnss_sensor.sensor,
             self.player]
+        for sensor in self.camera_manager.sensors:
+            actors.append(sensor)
         for actor in actors:
             if actor is not None:
                 actor.destroy()
@@ -326,7 +329,7 @@ class KeyboardControl(object):
             world.player.apply_control(self._control)
 
     def _parse_vehicle_keys(self, keys, milliseconds):
-        self._control.throttle = 1.0 if keys[K_UP] or keys[K_w] else 0.0
+        self._control.throttle = 0.7 if keys[K_UP] or keys[K_w] else 0.0
         steer_increment = 5e-4 * milliseconds
         if keys[K_LEFT] or keys[K_a]:
             self._steer_cache -= steer_increment
@@ -653,21 +656,25 @@ class GnssSensor(object):
 
 class CameraManager(object):
     def __init__(self, parent_actor, hud):
-        self.sensor = None
-        self._surface = None
+        self.sensors = []
+        self._surfaces = [0] * 2
         self._parent = parent_actor
         self._hud = hud
         self._recording = False
         self._camera_transforms = [
             carla.Transform(carla.Location(x=-5.5, z=2.8), carla.Rotation(pitch=-15)),
-            carla.Transform(carla.Location(x=1.6, z=1.7))]
+            carla.Transform(carla.Location(x=2, z=2.0)),
+            carla.Transform(carla.Location(x=42, z=50), carla.Rotation(pitch=-90))]
+        self._lidar_transforms = self._camera_transforms[1]
         self._transform_index = 1
         self._sensors = [
+            ['sensor.camera.rgb', cc.Raw, 'Camera RGB'],
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB'],
             ['sensor.camera.depth', cc.Raw, 'Camera Depth (Raw)'],
             ['sensor.camera.depth', cc.Depth, 'Camera Depth (Gray Scale)'],
             ['sensor.camera.depth', cc.LogarithmicDepth, 'Camera Depth (Logarithmic Gray Scale)'],
             ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)'],
+            ['sensor.camera.semantic_segmentation', cc.CityScapesPalette, 'Camera Semantic Segmentation (CityScapes Palette)'],
             ['sensor.camera.semantic_segmentation', cc.CityScapesPalette, 'Camera Semantic Segmentation (CityScapes Palette)'],
             ['sensor.lidar.ray_cast', None, 'Lidar (Ray-Cast)']]
         world = self._parent.get_world()
@@ -677,8 +684,12 @@ class CameraManager(object):
             if item[0].startswith('sensor.camera'):
                 bp.set_attribute('image_size_x', str(hud.dim[0]))
                 bp.set_attribute('image_size_y', str(hud.dim[1]))
+                bp.set_attribute('fov', '90')
             elif item[0].startswith('sensor.lidar'):
                 bp.set_attribute('range', '5000')
+                bp.set_attribute('points_per_second', '500000')
+                bp.set_attribute('upper_fov', '15')
+                bp.set_attribute('lower_fov', '-25')
             item.append(bp)
         self._index = None
 
@@ -688,20 +699,37 @@ class CameraManager(object):
 
     def set_sensor(self, index, notify=True):
         index = index % len(self._sensors)
-        needs_respawn = True if self._index is None \
-            else self._sensors[index][0] != self._sensors[self._index][0]
+        needs_respawn = self._index is None
+            #else self._sensors[index][0] != self._sensors[self._index][0]
         if needs_respawn:
-            if self.sensor is not None:
-                self.sensor.destroy()
-                self._surface = None
-            self.sensor = self._parent.get_world().spawn_actor(
-                self._sensors[index][-1],
-                self._camera_transforms[self._transform_index],
-                attach_to=self._parent)
+            # if self.sensor is not None:
+            #     self.sensor.destroy()
+            #     self._surface = None
+            # self.sensor = self._parent.get_world().spawn_actor(
+            #     self._sensors[index][-1],
+            #     self._camera_transforms[self._transform_index],
+            #     attach_to=self._parent)
             # We need to pass the lambda a weak reference to self to avoid
             # circular reference.
             weak_self = weakref.ref(self)
-            self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
+            ### create camera(s)
+            cameras_to_create    = [0, 1, 2, 6, 7]
+            transforms_to_create = [1, 2, 1, 1, 2]
+            for i, t in zip(cameras_to_create, transforms_to_create):
+                # even ids use first transform, odd ones use second transform
+                self.sensors.append(self._parent.get_world().spawn_actor(
+                    self._sensors[i][-1],
+                    self._camera_transforms[t],
+                    attach_to=self._parent))
+                if i is 0:
+                    self.sensors[-1].listen(lambda image: CameraManager._parse_image(weak_self, image))
+
+            ### create lidar
+            self.sensors.append(self._parent.get_world().spawn_actor(
+                self._sensors[8][-1],
+                self._lidar_transforms,
+                attach_to=self._parent))
+            # self.sensors[-1].listen(lambda image: CameraManager._parse_lidar(weak_self, image))
         if notify:
             self._hud.notification(self._sensors[index][2])
         self._index = index
@@ -714,37 +742,50 @@ class CameraManager(object):
         self._hud.notification('Recording %s' % ('On' if self._recording else 'Off'))
 
     def render(self, display):
-        if self._surface is not None:
-            display.blit(self._surface, (0, 0))
+        if self._surfaces[0] is not None:
+            display.blit(self._surfaces[0], (0, 0))
+
+    # @staticmethod
+    # def _parse_image(weak_self, image):
+    #     self = weak_self()
+    #     if not self:
+    #         return
+    #     if self._sensors[self._index][0].startswith('sensor.lidar'):
+    #         points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
+    #         points = np.reshape(points, (int(points.shape[0]/3), 3))
+    #         lidar_data = np.array(points[:, :2])
+    #         lidar_data *= min(self._hud.dim) / 100.0
+    #         lidar_data += (0.5 * self._hud.dim[0], 0.5 * self._hud.dim[1])
+    #         lidar_data = np.fabs(lidar_data)
+    #         lidar_data = lidar_data.astype(np.int32)
+    #         lidar_data = np.reshape(lidar_data, (-1, 2))
+    #         lidar_img_size = (self._hud.dim[0], self._hud.dim[1], 3)
+    #         lidar_img = np.zeros(lidar_img_size)
+    #         lidar_img[tuple(lidar_data.T)] = (255, 255, 255)
+    #         self._surface = pygame.surfarray.make_surface(lidar_img)
+    #     else:
+    #         image.convert(self._sensors[self._index][1])
+    #         array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
+    #         array = np.reshape(array, (image.height, image.width, 4))
+    #         array = array[:, :, :3]
+    #         array = array[:, :, ::-1]
+    #         self._surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+    #     if self._recording:
+    #         image.save_to_disk('_out/%08d' % image.frame_number)
 
     @staticmethod
     def _parse_image(weak_self, image):
         self = weak_self()
         if not self:
             return
-        if self._sensors[self._index][0].startswith('sensor.lidar'):
-            points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
-            points = np.reshape(points, (int(points.shape[0]/3), 3))
-            lidar_data = np.array(points[:, :2])
-            lidar_data *= min(self._hud.dim) / 100.0
-            lidar_data += (0.5 * self._hud.dim[0], 0.5 * self._hud.dim[1])
-            lidar_data = np.fabs(lidar_data)
-            lidar_data = lidar_data.astype(np.int32)
-            lidar_data = np.reshape(lidar_data, (-1, 2))
-            lidar_img_size = (self._hud.dim[0], self._hud.dim[1], 3)
-            lidar_img = np.zeros(lidar_img_size)
-            lidar_img[tuple(lidar_data.T)] = (255, 255, 255)
-            self._surface = pygame.surfarray.make_surface(lidar_img)
-        else:
-            image.convert(self._sensors[self._index][1])
-            array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-            array = np.reshape(array, (image.height, image.width, 4))
-            array = array[:, :, :3]
-            array = array[:, :, ::-1]
-            self._surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+        image.convert(self._sensors[0][1])
+        array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
+        array = np.reshape(array, (image.height, image.width, 4))
+        array = array[:, :, :3]
+        array = array[:, :, ::-1]
+        self._surfaces[0] = pygame.surfarray.make_surface(array.swapaxes(0, 1))
         if self._recording:
             image.save_to_disk('_out/%08d' % image.frame_number)
-
 
 # ==============================================================================
 # -- game_loop() ---------------------------------------------------------------
@@ -819,12 +860,12 @@ def main():
     argparser.add_argument(
         '--res',
         metavar='WIDTHxHEIGHT',
-        default='1280x720',
+        default='1024x768',
         help='window resolution (default: 1280x720)')
     argparser.add_argument(
         '--filter',
         metavar='PATTERN',
-        default='vehicle.*',
+        default='vehicle.nissan.patrol',
         help='actor filter (default: "vehicle.*")')
     args = argparser.parse_args()
 
